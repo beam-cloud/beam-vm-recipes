@@ -8,7 +8,7 @@ The public IPv6 address survives VM restarts. The HTTPS URL stays the same while
 
 - macOS or Linux with Python 3.9+ and OpenSSH on `PATH`.
 - The Beam CLI with `beam setup vm`, `beam vm ip`, and `beam vm scp` (install below).
-- An IPv6-capable internet connection from your computer to the VM. The CLI uses native IPv6 SSH. Public HTTPS visitors can use IPv4 or IPv6.
+- Internet access to Beam. Direct IPv6 is used when available; the authenticated HTTPS gateway is the automatic fallback. Public HTTPS visitors can use IPv4 or IPv6.
 - An Ubuntu/Debian Beam VM with SSH and systemd. The setup command below prepares one.
 
 ## Install Beam
@@ -49,6 +49,10 @@ python3 recipes/tunnel/configure.py tunnel-relay
 
 The configuration helper reads your VM's IPv6 address and published HTTPS URL through the installed Beam CLI. It retrieves the SSH host's **public key** using authenticated `beam vm exec`, then pins that key in a local `known_hosts` file.
 
+The helper checks for VM support when selecting the Beam executable. This avoids the older `beam-sdk` command that pyenv or a Python environment may put first on `PATH`. It records the selected executable and optional Beam context for gateway connections. Plain `python3` and `uv run` both work.
+
+To choose an executable explicitly, use `--beam-cli /path/to/beam` or set `BEAM_CLI`.
+
 Generated files live in `~/.config/beam-tunnel/` by default, or under `$XDG_CONFIG_HOME` if set. Your private SSH identity stays on your computer. The default identity is `~/.beam/ssh/vm_ed25519`, created by Beam VM setup.
 
 For another Beam context or identity:
@@ -86,7 +90,16 @@ In another terminal:
 ./recipes/tunnel/beam-tunnel 8080
 ```
 
-The terminal shows connection status, your local URL, the public HTTPS URL, the direct IPv6 URL, and elapsed time. It stays in the foreground. **Ctrl+C closes SSH and public forwarding.**
+The terminal shows connection status, the selected transport, your local URL, the public HTTPS URL, the direct IPv6 URL, and elapsed time. It stays in the foreground. **Ctrl+C closes the reverse listener, SSH, and any gateway forwarding process.**
+
+The default `auto` transport uses direct IPv6 when TCP/2222 is reachable, otherwise it uses `beam vm port-forward` to reach SSH through Beam's authenticated HTTPS gateway. Both routes verify the same pinned VM host key. You can choose a route explicitly:
+
+```sh
+./recipes/tunnel/beam-tunnel --transport ipv6 8080
+./recipes/tunnel/beam-tunnel --transport beam 8080
+```
+
+The direct IPv6 URL still requires IPv6 on the visitor's network; the public HTTPS URL works with either transport.
 
 Running `./recipes/tunnel/beam-tunnel` without arguments prompts for a port; the default is 3030. `--help` lists options. Output uses colors in a supported terminal and respects `NO_COLOR`; redirected output contains no terminal escape sequences.
 
@@ -108,11 +121,13 @@ flowchart LR
     forward -->|Encrypted SSH connection| app[Your computer: localhost app]
 ```
 
-Your computer initiates SSH to the VM's IPv6 address on port **2222**. The reverse listener binds only to VM loopback. Nginx handles public HTTP traffic and WebSocket upgrades, with buffering disabled for streaming and a 10 MiB request-body limit.
+Your computer initiates SSH to the VM on port **2222**, either directly over IPv6 or through a managed localhost bridge to Beam's HTTPS gateway. The reverse listener binds only to VM loopback. Nginx handles public HTTP traffic and WebSocket upgrades, with buffering disabled for streaming and a 10 MiB request-body limit.
 
 Nginx sends `Host: localhost` and forwards the original host in `X-Forwarded-Host`. Some frameworks need their trusted-proxy settings configured to use the forwarded headers.
 
 The CLI disables SSH agent forwarding, validates the pinned VM host key, and checks that the local port is listening before replacing an existing tunnel. A second session using the same configuration replaces the previous one. A separate configuration pointing at the same VM reverse port will contend for that port; only one can own it.
+
+The CLI waits for the VM to accept the reverse listener before displaying `connected`. At shutdown it cancels that listener and confirms the cancellation reached the VM before closing the transport.
 
 ## Validate
 
@@ -152,12 +167,14 @@ The original demo was tested with real HTTP GET/POST, WebSocket echo, live local
 | Symptom | What to check |
 | --- | --- |
 | `Nothing is listening on localhost` | Start the app first. It must accept connections on `127.0.0.1` at the selected port. |
+| `No such command 'vm'` when using Python | The older Beam SDK executable may be first on Python's `PATH`. The helper now skips it automatically; `BEAM_CLI=/path/to/beam` overrides selection. |
 | Public URL returns 502 | The VM's Nginx cannot reach your app: start the tunnel, check the local app, and check your SSH/network connection. |
-| SSH cannot reach the IPv6 address | The client network needs IPv6. Test TCP/2222 with `nc -6 -vz YOUR_VM_IPV6 2222`; ICMP ping is not a useful readiness check for this forwarding setup. |
+| SSH says `No route to host` | Leave transport on `auto` or choose `--transport beam`. Use `--transport ipv6` only when the client has an IPv6 route to the VM. |
+| Gateway reports `VM removed`, or public URL returns 404 | The configured relay has been deleted. Prepare or choose a relay VM, then rerun `configure.py` for its current address and host key. |
 | `remote port forwarding failed` | Another tunnel owns VM port 9000. Close it from its original terminal or with its `--stop` command. |
 | Host key verification failed | Confirm the VM and Beam context, then rerun `configure.py` to pin the current key through the authenticated API. |
 | HTML server appears to show JSON | Check the actual `index.html`: Python serves that file's contents; the filename does not convert JSON to HTML. |
 | `304` in Python's logs | Normal browser caching: the file has not changed. |
 | Favicon returns 404 | Normal for this sample; it has no favicon. |
 
-If the computer sleeps or SSH disconnects, rerun the tunnel after connectivity returns. The CLI reports a disconnect and exits; it does not automatically reconnect.
+If the computer sleeps or the tunnel session ends, rerun it after connectivity returns. Automatic transport selection does not restart an ended SSH session.

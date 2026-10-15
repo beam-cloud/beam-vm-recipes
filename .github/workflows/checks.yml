@@ -16,5 +16,5 @@ jobs:
         with:
           python-version: '3.9'
       - run: python3 -m unittest discover -s recipes/tunnel/tests -v
-      - run: python3 -m py_compile recipes/tunnel/beam-tunnel recipes/tunnel/configure.py
+      - run: python3 -m py_compile recipes/tunnel/beam-tunnel recipes/tunnel/configure.py recipes/tunnel/beam_cli.py
       - run: bash -n recipes/tunnel/setup-relay.sh

@@ -17,6 +17,9 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from beam_cli import find_beam_cli
+
 
 DEFAULT_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "beam-tunnel" / "config.json"
 
@@ -27,7 +30,8 @@ def config_path(value, directory):
 
 
 def load_config(path):
-    global VM_IP, PUBLIC_URL, DIRECT_URL, CONTROL, STOP_REQUEST, TARGET, SSH
+    global VM_IP, PUBLIC_URL, DIRECT_URL, CONTROL, STOP_REQUEST, ACTIVE_FORWARD, TARGET, SSH
+    global VM_NAME, BEAM_CLI, BEAM_CONTEXT, SSH_PORT, TRANSPORT
     path = path.expanduser().resolve()
     try:
         config = json.loads(path.read_text())
@@ -42,6 +46,13 @@ def load_config(path):
     except (KeyError, ValueError, TypeError):
         raise TunnelError("Set ipv6 to the relay VM's public IPv6 address.")
     ssh_port = config.get("ssh_port", 2222)
+    SSH_PORT = ssh_port
+    VM_NAME = config.get("vm_name")
+    BEAM_CLI = config.get("beam_cli")
+    BEAM_CONTEXT = config.get("beam_context")
+    TRANSPORT = config.get("transport", "auto")
+    if TRANSPORT not in ("auto", "ipv6", "beam"):
+        raise TunnelError("transport must be auto, ipv6, or beam.")
     listen_port = config.get("listen_port", 8000)
     remote_port = config.get("remote_port", 9000)
     for name, value in (("ssh_port", ssh_port), ("listen_port", listen_port), ("remote_port", remote_port)):
@@ -75,6 +86,7 @@ def load_config(path):
     state.chmod(0o700)
     CONTROL = state / "ssh-control"
     STOP_REQUEST = state / "stop-request"
+    ACTIVE_FORWARD = state / "forward.json"
     TARGET = f"{user}@{VM_IP}"
     ssh = shutil.which("ssh")
     if not ssh:
@@ -83,6 +95,7 @@ def load_config(path):
         ssh, "-F", "/dev/null", "-6", "-p", str(ssh_port), "-i", str(identity),
         "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ForwardAgent=no",
         "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
+        "-o", f"HostKeyAlias=[{VM_IP}]:{ssh_port}",
         "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
         "-o", "ServerAliveCountMax=2", "-S", str(CONTROL),
     ]
@@ -126,11 +139,42 @@ class Display:
         self.line(f"  {self.style(label.ljust(10), '2')}{value}")
 
 
-def control_command(operation):
+def control_command(operation, arguments=(), timeout=10):
     return subprocess.run(
-        SSH + ["-O", operation, TARGET], stdin=subprocess.DEVNULL,
-        capture_output=True, text=True, timeout=10,
+        SSH + ["-O", operation, *arguments, TARGET], stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=timeout,
     )
+
+
+def owned_forward(pid):
+    try:
+        value = json.loads(ACTIVE_FORWARD.read_text())
+        if value.get("pid") == pid and isinstance(value.get("forward"), str):
+            return value["forward"]
+    except (FileNotFoundError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def cancel_forward(pid):
+    forwarding = owned_forward(pid)
+    if forwarding:
+        result = control_command("cancel", ["-R", forwarding], timeout=3)
+        if result.returncode:
+            raise TunnelError(result.stderr.strip() or "The reverse listener could not be cancelled.")
+        flush_master()
+
+
+def flush_master():
+    # OpenSSH's cancel request has no server reply. A harmless command on
+    # the same ordered stream confirms it reached the VM before transport
+    # shutdown, including when that stream crosses the Beam gateway.
+    result = subprocess.run(
+        SSH + [TARGET, "true"], stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode:
+        raise TunnelError(result.stderr.strip() or "Could not confirm relay shutdown.")
 
 
 def master_running():
@@ -145,6 +189,7 @@ def stop_master():
     match = re.search(r"\bpid=(\d+)\b", check.stderr + check.stdout)
     if match:
         STOP_REQUEST.write_text(match.group(1))
+        cancel_forward(int(match.group(1)))
     result = control_command("exit")
     if result.returncode:
         STOP_REQUEST.unlink(missing_ok=True)
@@ -179,7 +224,56 @@ def stop_requested(process):
         return False
 
 
-def run_tunnel(port, remote_port, display):
+def ipv6_reachable():
+    try:
+        with socket.create_connection((VM_IP, SSH_PORT), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def start_beam_bridge(log):
+    if not isinstance(VM_NAME, str) or not VM_NAME:
+        raise TunnelError("Gateway transport needs vm_name in the config. Rerun configure.py for your relay VM.")
+    beam_cli = find_beam_cli(BEAM_CLI)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        local_port = listener.getsockname()[1]
+    command = [beam_cli, "vm", "port-forward", "--local-port", str(local_port)]
+    if BEAM_CONTEXT:
+        command += ["--context", BEAM_CONTEXT]
+    command += [VM_NAME, str(SSH_PORT)]
+    process = subprocess.Popen(
+        command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    return process, local_port
+
+
+def wait_for_bridge(process, local_port, log):
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise TunnelError("Beam gateway transport failed: " + ssh_error(log))
+        try:
+            with socket.create_connection(("127.0.0.1", local_port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise TunnelError("Beam gateway transport did not become ready within 20 seconds.")
+
+
+def close_process(process):
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def run_tunnel(port, remote_port, display, transport="auto"):
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=2):
             pass
@@ -191,15 +285,31 @@ def run_tunnel(port, remote_port, display):
         stop_master()
 
     process = None
+    bridge = None
     started = None
     interrupted = False
-    with tempfile.TemporaryFile(mode="w+t") as log:
+    shutdown_error = None
+    with tempfile.TemporaryFile(mode="w+t") as log, tempfile.TemporaryFile(mode="w+t") as bridge_log:
         try:
+            selected = transport
+            if selected == "auto":
+                selected = "ipv6" if ipv6_reachable() else "beam"
+                if selected == "beam":
+                    display.line("  " + display.style("IPv6 route unavailable; using Beam's authenticated gateway…", "2"))
+            ssh = SSH
+            target = TARGET
+            if selected == "beam":
+                bridge, local_port = start_beam_bridge(bridge_log)
+                wait_for_bridge(bridge, local_port, bridge_log)
+                ssh = list(SSH)
+                ssh[ssh.index("-6")] = "-4"
+                ssh[ssh.index("-p") + 1] = str(local_port)
+                target = TARGET.split("@", 1)[0] + "@127.0.0.1"
             process = subprocess.Popen(
-                SSH + ["-M", "-N", "-T", "-o", "ControlPersist=no",
-                       "-o", "ExitOnForwardFailure=yes",
-                       "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{port}", TARGET],
+                ssh + ["-M", "-N", "-T", "-o", "ControlPersist=no",
+                       "-o", "ExitOnForwardFailure=yes", target],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
+                start_new_session=True,
             )
             if not display.tty:
                 display.line("  Connecting to the relay…")
@@ -217,9 +327,18 @@ def run_tunnel(port, remote_port, display):
                 frame += 1
                 time.sleep(0.1)
 
+            # The control socket can exist before a remote forward is accepted.
+            # Request it separately and wait for the server's acknowledgement.
+            forwarding = f"127.0.0.1:{remote_port}:127.0.0.1:{port}"
+            result = control_command("forward", ["-R", forwarding], timeout=15)
+            if result.returncode:
+                raise TunnelError(result.stderr.strip() or "The relay refused the reverse listener.")
+            ACTIVE_FORWARD.write_text(json.dumps({"pid": process.pid, "forward": forwarding}))
+
             started = time.monotonic()
             display.clear()
             display.row("Status", display.style("● connected", "32"))
+            display.row("Transport", "direct IPv6" if selected == "ipv6" else "Beam gateway (HTTPS)")
             display.row("Local", f"http://127.0.0.1:{port}/")
             display.row("Public", display.style(PUBLIC_URL, "1;36"))
             display.row("IPv6", DIRECT_URL)
@@ -227,6 +346,8 @@ def run_tunnel(port, remote_port, display):
             if not display.tty:
                 display.line("  Tunnel stays open here. Press Ctrl+C to stop.")
             while process.poll() is None:
+                if bridge is not None and bridge.poll() is not None:
+                    raise TunnelError("Beam gateway transport disconnected: " + ssh_error(bridge_log))
                 display.status(display.style(f"Tunnel open · {elapsed(time.monotonic() - started)} · Ctrl+C to stop", "2"))
                 time.sleep(1)
             if process.returncode and not stop_requested(process):
@@ -240,20 +361,26 @@ def run_tunnel(port, remote_port, display):
             previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
             try:
                 if process is not None and process.poll() is None:
-                    process.terminate()
                     try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                        cancel_forward(process.pid)
+                        control_command("exit", timeout=3)
+                    except (TunnelError, OSError, subprocess.TimeoutExpired) as error:
+                        shutdown_error = str(error)
+                close_process(process)
+                close_process(bridge)
             finally:
                 signal.signal(signal.SIGINT, previous_handler)
             if process is not None and stop_requested(process):
                 STOP_REQUEST.unlink(missing_ok=True)
+            if process is not None and owned_forward(process.pid):
+                ACTIVE_FORWARD.unlink(missing_ok=True)
         if interrupted:
             duration = f"  Session lasted {elapsed(time.monotonic() - started)}." if started else ""
             display.line("  " + display.style("● stopped", "2") + duration)
-            display.line("  Public forwarding is closed.")
+            if shutdown_error:
+                display.line("  " + display.style("Relay shutdown could not be confirmed: " + shutdown_error, "31"))
+            else:
+                display.line("  Public forwarding is closed.")
 
 
 def interrupt(_signum, _frame):
@@ -267,6 +394,7 @@ def main():
     parser.add_argument("port", nargs="?", type=port_number, help="Local port (prompts when omitted; default: 3030)")
     parser.add_argument("--stop", action="store_true", help="Close an existing tunnel from another terminal")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Relay configuration JSON (default: ~/.config/beam-tunnel/config.json)")
+    parser.add_argument("--transport", choices=("auto", "ipv6", "beam"), help="Connection route (default: auto, preferring direct IPv6)")
     args = parser.parse_args()
     if args.stop and args.port is not None:
         parser.error("Use either a local port or --stop.")
@@ -297,7 +425,7 @@ def main():
                 display.line()
             else:
                 port = 3030
-        run_tunnel(port, remote_port, display)
+        run_tunnel(port, remote_port, display, args.transport or TRANSPORT)
         return 0
     except (TunnelError, OSError, ValueError, TypeError, subprocess.TimeoutExpired) as error:
         display.clear()

@@ -29,7 +29,7 @@ Start with the [tunnel recipe](recipes/tunnel/README.md). It uses Python's stand
 
 The VM keeps its public IPv6 address across stop/start and pause/resume. Its writable disk also persists, so installed services and configuration remain available when it starts again. Connections are interrupted while the VM is stopped; clients reconnect to the same address afterward.
 
-These recipes use published TCP ports. The tunnel recipe requires an IPv6-capable connection from your computer to the VM; visitors can use the public HTTPS URL without a direct IPv6 connection.
+These recipes use published TCP ports. The tunnel prefers direct IPv6 and automatically uses Beam's authenticated HTTPS gateway when that route is unavailable. Visitors can use the public HTTPS URL without a direct IPv6 connection.
 
 VMs keep running and billing until stopped. Each recipe documents how to stop its processes and the VM.
 

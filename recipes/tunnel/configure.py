@@ -11,12 +11,15 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from beam_cli import find_beam_cli
+
 
 DEFAULT_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "beam-tunnel" / "config.json"
 
 
-def beam_json(operation, vm, context=None, tail=()):
-    command = ["beam", "vm", operation, "--json"]
+def beam_json(operation, vm, context=None, tail=(), beam_cli=None):
+    command = [beam_cli or find_beam_cli(), "vm", operation, "--json"]
     if context:
         command += ["--context", context]
     command += [vm, *tail]
@@ -43,20 +46,20 @@ def verified_host_key(stdout):
     return f"{algorithm} {value}"
 
 
-def write_config(vm, path, identity, context=None):
-    info = beam_json("get", vm, context)
+def write_config(vm, path, identity, context=None, beam_cli=None):
+    info = beam_json("get", vm, context, beam_cli=beam_cli)
     try:
         ipv6 = str(ipaddress.IPv6Address(info["public_ipv6"]))
     except (KeyError, ValueError, TypeError):
         raise ValueError("The VM has no public IPv6 address. Wait for it to become ready.")
-    ports = beam_json("ports", vm, context)
+    ports = beam_json("ports", vm, context, beam_cli=beam_cli)
     public_url = ports.get("8000")
     if not isinstance(public_url, str):
         raise ValueError(f"Publish the relay first: beam vm expose --public {vm} 8000")
     url = urlsplit(public_url)
     if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
         raise ValueError("The relay URL must be stable and contain no access token. Publish port 8000 as public.")
-    result = beam_json("exec", vm, context, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"])
+    result = beam_json("exec", vm, context, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"], beam_cli=beam_cli)
     if result.get("exit_code") != 0:
         raise ValueError("Could not read the VM public SSH host key through Beam.")
     key = verified_host_key(result.get("stdout", ""))
@@ -70,6 +73,9 @@ def write_config(vm, path, identity, context=None):
     hosts.chmod(0o600)
     config = {
         "vm_name": vm,
+        "beam_cli": beam_cli,
+        "beam_context": context,
+        "transport": "auto",
         "ipv6": ipv6,
         "public_url": public_url,
         "ssh_user": "root",
@@ -90,9 +96,11 @@ def main():
     parser.add_argument("--context", help="Beam CLI context")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Where to write config.json")
     parser.add_argument("--identity", type=Path, default=Path("~/.beam/ssh/vm_ed25519"), help="Local private SSH identity path")
+    parser.add_argument("--beam-cli", help="Beam executable override (also configurable with BEAM_CLI)")
     args = parser.parse_args()
     try:
-        path, url = write_config(args.vm, args.config, args.identity, args.context)
+        beam_cli = find_beam_cli(args.beam_cli)
+        path, url = write_config(args.vm, args.config, args.identity, args.context, beam_cli)
     except (ValueError, OSError, TypeError) as error:
         print(f"Configuration failed: {error}", file=sys.stderr)
         return 1
@@ -100,6 +108,7 @@ def main():
         print("Configuration cancelled.", file=sys.stderr)
         return 130
     print(f"Configuration: {path}")
+    print(f"Beam CLI: {beam_cli}")
     print("VM host key pinned through authenticated Beam exec.")
     print(f"Public URL: {url}")
     print("Start your local app, then run recipes/tunnel/beam-tunnel LOCAL_PORT.")
