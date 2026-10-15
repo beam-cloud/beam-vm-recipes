@@ -8,12 +8,22 @@ Small, runnable recipes for [Beam persistent VMs](https://platform.beam.cloud/ge
 | --- | --- |
 | [Localhost tunnel](recipes/tunnel/) | Share a local app through a Beam VM. Public HTTPS, direct IPv6, an interactive terminal, and Ctrl+C to stop. |
 
-Start with the [tunnel recipe](recipes/tunnel/README.md). It uses Python's standard library, OpenSSH, and Nginx; no third-party Python packages are required.
+## Get started
+
+Install the Beam CLI:
+
+```sh
+curl -fsSL https://www.beam.cloud/install | sh
+```
+
+Clone the recipes:
 
 ```sh
 git clone https://github.com/beam-cloud/beam-vm-recipes.git
 cd beam-vm-recipes
 ```
+
+Start with the [tunnel recipe](recipes/tunnel/README.md). It uses Python's standard library, OpenSSH, and Nginx; no third-party Python packages are required. Its configuration helper records your relay VM's address and verified SSH host key.
 
 ## What persistence means
 

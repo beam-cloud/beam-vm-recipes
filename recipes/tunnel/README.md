@@ -7,11 +7,17 @@ The public IPv6 address survives VM restarts. The HTTPS URL stays the same while
 ## Requirements
 
 - macOS or Linux with Python 3.9+ and OpenSSH on `PATH`.
-- A current [Beam CLI](https://platform.beam.cloud/get-started) with `beam setup vm`, `beam vm ip`, and `beam vm scp`.
+- The Beam CLI with `beam setup vm`, `beam vm ip`, and `beam vm scp` (install below).
 - An IPv6-capable internet connection from your computer to the VM. The CLI uses native IPv6 SSH. Public HTTPS visitors can use IPv4 or IPv6.
 - An Ubuntu/Debian Beam VM with SSH and systemd. The setup command below prepares one.
 
-Run all commands below from the repository root.
+## Install Beam
+
+```sh
+curl -fsSL https://www.beam.cloud/install | sh
+```
+
+Then run the recipe commands below from the repository root.
 
 ## 1. Prepare the relay VM
 
@@ -41,7 +47,7 @@ Publishing port 8000 makes the forwarded app publicly accessible. Serve a dedica
 python3 recipes/tunnel/configure.py tunnel-relay
 ```
 
-The helper reads the IPv6 address and published HTTPS URL through Beam. It retrieves the SSH host's **public key** using authenticated `beam vm exec`, then pins that key in a local `known_hosts` file. It does not use an unauthenticated `ssh-keyscan` or disable host-key verification.
+The configuration helper reads your VM's IPv6 address and published HTTPS URL through the installed Beam CLI. It retrieves the SSH host's **public key** using authenticated `beam vm exec`, then pins that key in a local `known_hosts` file.
 
 Generated files live in `~/.config/beam-tunnel/` by default, or under `$XDG_CONFIG_HOME` if set. Your private SSH identity stays on your computer. The default identity is `~/.beam/ssh/vm_ed25519`, created by Beam VM setup.
 
@@ -132,7 +138,7 @@ beam vm ip tunnel-relay
 
 Wait for SSH to become ready before reconnecting. The two IP commands should print the same address. Active SSH connections do not survive a VM shutdown.
 
-The original demo was tested with real HTTP GET/POST, WebSocket echo, live local edits, VM stop/start, foreground Ctrl+C shutdown, and stopping from another terminal. This portable recipe is validated against a real Beam relay before publishing. Automated local checks are in `tests/` and GitHub Actions. HTTP streaming is configured but has not been separately measured.
+The original demo was tested with real HTTP GET/POST, WebSocket echo, live local edits, VM stop/start, foreground Ctrl+C shutdown, and stopping from another terminal. The recipe's tunnel CLI was also validated against a real Beam relay before publishing. Automated local checks are in `tests/` and GitHub Actions. HTTP streaming is configured but has not been separately measured.
 
 ## Cleanup
 
