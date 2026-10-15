@@ -1,0 +1,11 @@
+{
+  "vm_name": "tunnel-relay",
+  "ipv6": "2001:db8::1",
+  "public_url": "https://your-published-port.example.invalid/",
+  "ssh_user": "root",
+  "ssh_port": 2222,
+  "identity_file": "~/.beam/ssh/vm_ed25519",
+  "known_hosts_file": "known_hosts",
+  "listen_port": 8000,
+  "remote_port": 9000
+}

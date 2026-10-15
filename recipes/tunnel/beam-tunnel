@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""A foreground SSH tunnel with a dependency-free terminal display."""
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import signal
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+DEFAULT_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "beam-tunnel" / "config.json"
+
+
+def config_path(value, directory):
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else directory / path
+
+
+def load_config(path):
+    global VM_IP, PUBLIC_URL, DIRECT_URL, CONTROL, STOP_REQUEST, TARGET, SSH
+    path = path.expanduser().resolve()
+    try:
+        config = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise TunnelError(f"No configuration at {path}. Run configure.py for your relay VM first.")
+    except json.JSONDecodeError as error:
+        raise TunnelError(f"Invalid JSON in {path}: {error.msg}")
+    if not isinstance(config, dict):
+        raise TunnelError("The configuration must be a JSON object.")
+    try:
+        VM_IP = str(ipaddress.IPv6Address(config["ipv6"]))
+    except (KeyError, ValueError, TypeError):
+        raise TunnelError("Set ipv6 to the relay VM's public IPv6 address.")
+    ssh_port = config.get("ssh_port", 2222)
+    listen_port = config.get("listen_port", 8000)
+    remote_port = config.get("remote_port", 9000)
+    for name, value in (("ssh_port", ssh_port), ("listen_port", listen_port), ("remote_port", remote_port)):
+        if type(value) is not int or not 1 <= value <= 65535:
+            raise TunnelError(f"{name} must be an integer between 1 and 65535.")
+    user = config.get("ssh_user", "root")
+    if not isinstance(user, str) or not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_-]*", user):
+        raise TunnelError("ssh_user must be an SSH username.")
+    identity = config_path(config.get("identity_file", "~/.beam/ssh/vm_ed25519"), path.parent)
+    known_hosts = config_path(config.get("known_hosts_file", "known_hosts"), path.parent)
+    for label, file in (("SSH identity", identity), ("Verified known_hosts", known_hosts)):
+        if not file.is_file():
+            raise TunnelError(f"{label} file is missing: {file}")
+    DIRECT_URL = f"http://[{VM_IP}]:{listen_port}/"
+    PUBLIC_URL = config.get("public_url") or DIRECT_URL
+    if not isinstance(PUBLIC_URL, str):
+        raise TunnelError("public_url must be an HTTP or HTTPS URL.")
+    url = urlsplit(PUBLIC_URL)
+    if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
+        raise TunnelError("public_url must be a stable HTTP or HTTPS URL without credentials or access tokens.")
+    # Short paths fit OpenSSH's Unix socket limit, including on macOS.
+    state_root = Path("/tmp") / f"beam-tunnel-{os.getuid()}"
+    if state_root.is_symlink() or (state_root.exists() and state_root.stat().st_uid != os.getuid()):
+        raise TunnelError(f"State directory is not owned by this user: {state_root}")
+    state_root.mkdir(mode=0o700, exist_ok=True)
+    state_root.chmod(0o700)
+    state = state_root / hashlib.sha256(str(path).encode()).hexdigest()[:12]
+    if state.is_symlink():
+        raise TunnelError(f"State directory must not be a symlink: {state}")
+    state.mkdir(mode=0o700, exist_ok=True)
+    state.chmod(0o700)
+    CONTROL = state / "ssh-control"
+    STOP_REQUEST = state / "stop-request"
+    TARGET = f"{user}@{VM_IP}"
+    ssh = shutil.which("ssh")
+    if not ssh:
+        raise TunnelError("Install OpenSSH and make ssh available on PATH.")
+    SSH = [
+        ssh, "-F", "/dev/null", "-6", "-p", str(ssh_port), "-i", str(identity),
+        "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "ForwardAgent=no",
+        "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
+        "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=2", "-S", str(CONTROL),
+    ]
+    return remote_port
+
+
+class TunnelError(Exception):
+    pass
+
+
+class Display:
+    def __init__(self):
+        self.tty = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+        self.color = self.tty and "NO_COLOR" not in os.environ
+        self.live = False
+
+    def style(self, text, code):
+        return f"\033[{code}m{text}\033[0m" if self.color else text
+
+    def clear(self):
+        if self.live:
+            print("\r\033[2K", end="", flush=True)
+            self.live = False
+
+    def line(self, text=""):
+        self.clear()
+        print(text, flush=True)
+
+    def status(self, text):
+        if self.tty:
+            print(f"\r\033[2K  {text}", end="", flush=True)
+            self.live = True
+
+    def header(self):
+        self.line()
+        self.line("  " + self.style("◆  beam tunnel", "1;36"))
+        self.line("  " + self.style("Share localhost. Keep control.", "2"))
+        self.line()
+
+    def row(self, label, value):
+        self.line(f"  {self.style(label.ljust(10), '2')}{value}")
+
+
+def control_command(operation):
+    return subprocess.run(
+        SSH + ["-O", operation, TARGET], stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=10,
+    )
+
+
+def master_running():
+    return CONTROL.exists() and control_command("check").returncode == 0
+
+
+def stop_master():
+    # OpenSSH may exit with 255 for a successful control-command shutdown.
+    # Record the exact master PID so its foreground display can distinguish
+    # an intentional stop from a lost connection.
+    check = control_command("check")
+    match = re.search(r"\bpid=(\d+)\b", check.stderr + check.stdout)
+    if match:
+        STOP_REQUEST.write_text(match.group(1))
+    result = control_command("exit")
+    if result.returncode:
+        STOP_REQUEST.unlink(missing_ok=True)
+        raise TunnelError(result.stderr.strip() or "Could not close the previous tunnel.")
+    deadline = time.monotonic() + 5
+    while master_running():
+        if time.monotonic() >= deadline:
+            raise TunnelError("Previous tunnel is still closing. Try again in a moment.")
+        time.sleep(0.1)
+
+
+def port_number(value):
+    if not value.isascii() or not value.isdecimal() or len(value) > 5 or not 1 <= int(value) <= 65535:
+        raise argparse.ArgumentTypeError("Choose a port between 1 and 65535.")
+    return int(value)
+
+
+def elapsed(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+
+def ssh_error(log):
+    log.seek(0)
+    return log.read().strip() or "SSH disconnected. Check your network and that the relay VM is running."
+
+
+def stop_requested(process):
+    try:
+        return STOP_REQUEST.read_text() == str(process.pid)
+    except FileNotFoundError:
+        return False
+
+
+def run_tunnel(port, remote_port, display):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            pass
+    except OSError:
+        raise TunnelError(f"Nothing is listening on localhost:{port}. Start your app, then try again.")
+
+    if master_running():
+        display.line("  " + display.style("Replacing the previous tunnel…", "2"))
+        stop_master()
+
+    process = None
+    started = None
+    interrupted = False
+    with tempfile.TemporaryFile(mode="w+t") as log:
+        try:
+            process = subprocess.Popen(
+                SSH + ["-M", "-N", "-T", "-o", "ControlPersist=no",
+                       "-o", "ExitOnForwardFailure=yes",
+                       "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{port}", TARGET],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
+            )
+            if not display.tty:
+                display.line("  Connecting to the relay…")
+            deadline = time.monotonic() + 15
+            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            frame = 0
+            while True:
+                if process.poll() is not None:
+                    raise TunnelError(ssh_error(log))
+                if master_running():
+                    break
+                if time.monotonic() >= deadline:
+                    raise TunnelError("The relay did not become ready within 15 seconds.")
+                display.status(display.style(f"{frames[frame % len(frames)]} Connecting to the relay…", "36"))
+                frame += 1
+                time.sleep(0.1)
+
+            started = time.monotonic()
+            display.clear()
+            display.row("Status", display.style("● connected", "32"))
+            display.row("Local", f"http://127.0.0.1:{port}/")
+            display.row("Public", display.style(PUBLIC_URL, "1;36"))
+            display.row("IPv6", DIRECT_URL)
+            display.line()
+            if not display.tty:
+                display.line("  Tunnel stays open here. Press Ctrl+C to stop.")
+            while process.poll() is None:
+                display.status(display.style(f"Tunnel open · {elapsed(time.monotonic() - started)} · Ctrl+C to stop", "2"))
+                time.sleep(1)
+            if process.returncode and not stop_requested(process):
+                raise TunnelError(ssh_error(log))
+            display.line("  " + display.style("● stopped", "2") + "  Tunnel closed from another terminal.")
+        except KeyboardInterrupt:
+            interrupted = True
+        finally:
+            display.clear()
+            # Finish shutdown even if Ctrl+C is pressed repeatedly.
+            previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            try:
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            finally:
+                signal.signal(signal.SIGINT, previous_handler)
+            if process is not None and stop_requested(process):
+                STOP_REQUEST.unlink(missing_ok=True)
+        if interrupted:
+            duration = f"  Session lasted {elapsed(time.monotonic() - started)}." if started else ""
+            display.line("  " + display.style("● stopped", "2") + duration)
+            display.line("  Public forwarding is closed.")
+
+
+def interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="beam-tunnel", description="Share a local app through your Beam relay. Ctrl+C closes the tunnel."
+    )
+    parser.add_argument("port", nargs="?", type=port_number, help="Local port (prompts when omitted; default: 3030)")
+    parser.add_argument("--stop", action="store_true", help="Close an existing tunnel from another terminal")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Relay configuration JSON (default: ~/.config/beam-tunnel/config.json)")
+    args = parser.parse_args()
+    if args.stop and args.port is not None:
+        parser.error("Use either a local port or --stop.")
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, interrupt)
+    display = Display()
+    try:
+        display.header()
+        remote_port = load_config(args.config)
+        if args.stop:
+            if master_running():
+                stop_master()
+                display.line("  " + display.style("● stopped", "2") + "  Public forwarding is closed.")
+            else:
+                display.line("  No tunnel is running.")
+            return 0
+        port = args.port
+        if port is None:
+            if sys.stdin.isatty():
+                while True:
+                    value = input("  Local port [3030]: ").strip() or "3030"
+                    try:
+                        port = port_number(value)
+                        break
+                    except argparse.ArgumentTypeError as error:
+                        display.line("  " + display.style(str(error), "31"))
+                display.line()
+            else:
+                port = 3030
+        run_tunnel(port, remote_port, display)
+        return 0
+    except (TunnelError, OSError, ValueError, TypeError, subprocess.TimeoutExpired) as error:
+        display.clear()
+        display.line("  " + display.style("● error", "31") + f"  {error}")
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        display.clear()
+        display.line("  Cancelled.")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
